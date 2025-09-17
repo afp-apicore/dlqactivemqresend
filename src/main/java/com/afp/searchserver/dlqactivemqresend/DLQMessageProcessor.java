@@ -1,88 +1,90 @@
 package com.afp.searchserver.dlqactivemqresend;
 
+import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.jms.BytesMessage;
+import jakarta.jms.Connection;
+import jakarta.jms.Destination;
+import jakarta.jms.JMSException;
+import jakarta.jms.MapMessage;
+import jakarta.jms.Message;
+import jakarta.jms.MessageConsumer;
+import jakarta.jms.MessageProducer;
+import jakarta.jms.ObjectMessage;
+import jakarta.jms.Queue;
+import jakarta.jms.QueueBrowser;
+import jakarta.jms.Session;
+import jakarta.jms.TextMessage;
 import org.apache.activemq.ActiveMQConnectionFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
 
-import javax.jms.BytesMessage;
-import javax.jms.Connection;
-import javax.jms.Destination;
-import javax.jms.JMSException;
-import javax.jms.MapMessage;
-import javax.jms.Message;
-import javax.jms.MessageConsumer;
-import javax.jms.MessageProducer;
-import javax.jms.ObjectMessage;
-import javax.jms.Queue;
-import javax.jms.QueueBrowser;
-import javax.jms.Session;
-import javax.jms.TextMessage;
-import java.util.Date;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
+import java.util.List;
 
+@Component
 public class DLQMessageProcessor {
     private static final Logger logger = LoggerFactory.getLogger(DLQMessageProcessor.class);
-
-    private static final String ACTIVEMQ_URL = "failover:(nio://apicore-uat-v2-euw3-az2-activemq.afp-apicore.afpaws.private:61616,nio://apicore-uat-v2-euw3-az1-activemq.afp-apicore.afpaws.private:61616,nio://apicore-uat-v2-euw3-az3-activemq.afp-apicore.afpaws.private:61616)?randomize=false&priorityBackup=true";
     private static final String DLQ_NAME = "ActiveMQ.DLQ";
-    private static final String USERNAME = "admin";
-    private static final String PASSWORD = "72c0305649e541f83df80cf1094e6bce";
-    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    static {
+        StreamReadConstraints.overrideDefaultStreamReadConstraints(
+                StreamReadConstraints.builder()
+                        .maxNestingDepth(5000)
+                        .build()
+        );
+    }
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    private final String activeMQurl;
+    private final String password;
+    private final String username;
 
     private Connection connection;
     private Session session;
     private int processedCount = 0;
     private int failedCount = 0;
 
+    public DLQMessageProcessor(@Value("${activemq.url}") String activeMQurl,
+                               @Value("${activemq.username}") String username,
+                               @Value("${activemq.password}") String password) {
+        this.activeMQurl = activeMQurl;
+        this.username = username;
+        this.password = password;
+    }
+
+    public void handleDeadLetterQueue() {
+        try {
+            connect();
+
+            // Process and resend messages from DLQ
+            processDLQMessages();
+
+        } catch (JMSException e) {
+            logger.error("JMS error during scheduled DLQ processing", e);
+        } catch (Exception e) {
+            logger.error("Unexpected error during scheduled DLQ processing", e);
+        } finally {
+            disconnect();
+        }
+    }
 
     public void connect() throws JMSException {
-        logger.info("Connecting to ActiveMQ at {}", ACTIVEMQ_URL);
+        logger.info("Connecting to ActiveMQ at {}", activeMQurl);
 
-        ActiveMQConnectionFactory connectionFactory = new ActiveMQConnectionFactory(ACTIVEMQ_URL);
-        connectionFactory.setUserName(USERNAME);
-        connectionFactory.setPassword(PASSWORD);
+        ActiveMQConnectionFactory connectionFactory = new ActiveMQConnectionFactory(activeMQurl);
+        connectionFactory.setUserName(username);
+        connectionFactory.setPassword(password);
 
         connection = connectionFactory.createConnection();
         connection.start();
 
         session = connection.createSession(false, Session.AUTO_ACKNOWLEDGE);
         logger.info("Connected successfully to ActiveMQ");
-    }
-
-    public void browseDLQMessages() throws JMSException {
-        logger.info("Browsing messages in DLQ: {}", DLQ_NAME);
-
-        Queue dlqQueue = session.createQueue(DLQ_NAME);
-        QueueBrowser browser = session.createBrowser(dlqQueue);
-
-        @SuppressWarnings("unchecked")
-        Enumeration<Message> messages = browser.getEnumeration();
-
-        int messageCount = 0;
-        while (messages.hasMoreElements()) {
-            Message message = messages.nextElement();
-            messageCount++;
-
-            logger.info("=== Message {} ===", messageCount);
-            if (!(message instanceof TextMessage textMessage)) {
-                logger.warn("Unexpected Message Type: {}", message.getClass().getSimpleName());
-                continue;
-            }
-
-            String dlqDeliveryFailureCause = getDlqDeliveryFailureCause(message);
-            if (dlqDeliveryFailureCause != null) {
-                logger.info("DlqDeliveryFailureCause: {}", dlqDeliveryFailureCause);
-            }
-
-            String text = textMessage.getText();
-            logger.info("Text Content: {}", text != null && text.length() > 100 ?
-                    text.replaceAll("\n", "") : text);
-        }
-
-        browser.close();
-        logger.info("Found {} messages in DLQ", messageCount);
     }
 
     private String getDlqDeliveryFailureCause(Message message) throws JMSException {
@@ -155,8 +157,8 @@ public class DLQMessageProcessor {
 
     private String extractAndLogTextContent(TextMessage textMessage) throws JMSException {
         String text = textMessage.getText();
-        logger.info("Text Content: {}", text != null && text.length() > 100 ?
-                text.substring(0, 100) + "..." : text);
+        logger.info("Text Content: {}", text != null && text.length() > 200 ?
+                text.substring(0, 200) + "..." : text);
         return text;
     }
 
@@ -194,6 +196,8 @@ public class DLQMessageProcessor {
                 } else if (typedMap.containsKey("rendition")) {
                     return "topic://statistics.stegano";
                 }
+            } else if (jsonObject instanceof List<?>) {
+                return "topic://notify";
             }
         } catch (Exception e) {
             logger.debug("Message content is not valid JSON: {}", e.getMessage());
@@ -349,23 +353,6 @@ public class DLQMessageProcessor {
         }
     }
 
-    private void logMessageHeaders(Message message) throws JMSException {
-        logger.info("JMS Headers:");
-        logger.info("  JMSDestination: {}", message.getJMSDestination());
-        logger.info("  JMSReplyTo: {}", message.getJMSReplyTo());
-        logger.info("  JMSCorrelationID: {}", message.getJMSCorrelationID());
-        logger.info("  JMSTimestamp: {}", new Date(message.getJMSTimestamp()));
-
-        logger.info("Custom Properties:");
-        @SuppressWarnings("unchecked")
-        Enumeration<String> propertyNames = message.getPropertyNames();
-        while (propertyNames.hasMoreElements()) {
-            String propertyName = propertyNames.nextElement();
-            Object value = message.getObjectProperty(propertyName);
-            logger.info("  {}: {}", propertyName, value);
-        }
-    }
-
     public void disconnect() {
         try {
             if (session != null) {
@@ -381,7 +368,7 @@ public class DLQMessageProcessor {
     }
 
     // Utility method for processing specific messages
-    public void processSpecificMessage(String messageId) throws JMSException {
+    void processSpecificMessage(String messageId) throws JMSException {
         String messageSelector = "JMSMessageID = '" + messageId + "'";
 
         Queue dlqQueue = session.createQueue(DLQ_NAME);
@@ -405,5 +392,40 @@ public class DLQMessageProcessor {
             consumer.close();
             producer.close();
         }
+    }
+
+
+    void browseDLQMessages() throws JMSException {
+        logger.info("Browsing messages in DLQ: {}", DLQ_NAME);
+
+        Queue dlqQueue = session.createQueue(DLQ_NAME);
+        QueueBrowser browser = session.createBrowser(dlqQueue);
+
+        @SuppressWarnings("unchecked")
+        Enumeration<Message> messages = browser.getEnumeration();
+
+        int messageCount = 0;
+        while (messages.hasMoreElements()) {
+            Message message = messages.nextElement();
+            messageCount++;
+
+            logger.info("=== Message {} ===", messageCount);
+            if (!(message instanceof TextMessage textMessage)) {
+                logger.warn("Unexpected Message Type: {}", message.getClass().getSimpleName());
+                continue;
+            }
+
+            String dlqDeliveryFailureCause = getDlqDeliveryFailureCause(message);
+            if (dlqDeliveryFailureCause != null) {
+                logger.info("DlqDeliveryFailureCause: {}", dlqDeliveryFailureCause);
+            }
+
+            String text = textMessage.getText();
+            logger.info("Text Content: {}", text != null && text.length() > 100 ?
+                    text.replaceAll("\n", "") : text);
+        }
+
+        browser.close();
+        logger.info("Found {} messages in DLQ", messageCount);
     }
 }
