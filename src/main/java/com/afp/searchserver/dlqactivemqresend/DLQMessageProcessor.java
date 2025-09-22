@@ -1,5 +1,6 @@
 package com.afp.searchserver.dlqactivemqresend;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.StreamReadConstraints;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.jms.BytesMessage;
@@ -151,7 +152,7 @@ public class DLQMessageProcessor {
             return null;
         }
 
-        String jsonText = unescapeJsonString(text);
+        String jsonText = getJsonText(text);
         return determineDestinationFromJson(jsonText);
     }
 
@@ -162,18 +163,17 @@ public class DLQMessageProcessor {
         return text;
     }
 
-    private String unescapeJsonString(String text) {
+    private String getJsonText(String text) {
         if (text == null || !text.startsWith("\"") || !text.endsWith("\"") || text.length() <= 2) {
             return text;
         }
 
-        // Remove outer quotes and unescape the JSON string
-        String jsonText = text.substring(1, text.length() - 1);
-        return jsonText.replaceAll("\\\\\"", "\"")
-                .replaceAll("\\\\\\\\", "\\\\")
-                .replaceAll("\\\\n", "\n")
-                .replaceAll("\\\\r", "\r")
-                .replaceAll("\\\\t", "\t");
+        try {
+            return objectMapper.readValue(text, String.class);
+        } catch (JsonProcessingException e) {
+            logger.error("Failed to get json string {}", e.getMessage());
+            return null;
+        }
     }
 
     private String determineDestinationFromJson(String jsonText) {
@@ -334,7 +334,7 @@ public class DLQMessageProcessor {
         return false;
     }
 
-    private void cleanDLQProperties(Message message) throws JMSException {
+    private void cleanDLQProperties(Message message) {
         // Remove DLQ-specific properties that shouldn't be on the resent message
         String[] propertiesToRemove = {
                 "dlqDeliveryFailureCause",
